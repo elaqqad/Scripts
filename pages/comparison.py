@@ -1,133 +1,136 @@
 # comparison.py
 import dash
 from dash import html, dcc, dash_table, register_page, callback
-from dash.dependencies import Input, Output, State
+from dash.dependencies import Input, Output
 import dash_bootstrap_components as dbc
 import pandas as pd
-from summary import generate_summary
+import numpy as np
+from summary import generate_summary, identify_categories, get_numeric_columns
 
-register_page(__name__, path='/comparison')
+def compare_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Compare full dataframes grouped by all categories"""
+    categories = identify_categories(df1)
+    numeric_cols = get_numeric_columns(df1)
+    
+    # Group by all categories and currency
+    group_cols = categories + ['Currency']
+    
+    # Aggregate both dataframes
+    agg_dict = {col: 'sum' for col in numeric_cols}
+    df1_grouped = df1.groupby(group_cols).agg(agg_dict).reset_index()
+    df2_grouped = df2.groupby(group_cols).agg(agg_dict).reset_index()
+    
+    # Merge the grouped dataframes
+    merged = pd.merge(
+        df1_grouped, df2_grouped,
+        on=group_cols,
+        suffixes=('_df1', '_df2'),
+        how='outer'
+    )
+    
+    # Calculate differences and filter based on threshold
+    result_rows = []
+    for col in numeric_cols:
+        col_df1 = f'{col}_df1'
+        col_df2 = f'{col}_df2'
+        
+        # Fill NaN with 0 for comparison
+        merged[col_df1] = merged[col_df1].fillna(0)
+        merged[col_df2] = merged[col_df2].fillna(0)
+        
+        # Calculate absolute and relative differences
+        merged[f'{col}_diff'] = merged[col_df2] - merged[col_df1]
+        merged[f'{col}_rel_diff'] = (merged[f'{col}_diff'].abs() / 
+                                   merged[col_df1].abs().clip(lower=1e-10))
+        
+    # Filter rows where at least one column has difference above threshold
+    diff_cols = [f'{col}_rel_diff' for col in numeric_cols]
+    significant_diffs = merged[merged[diff_cols].max(axis=1) > threshold].copy()
+    
+    # Format numeric columns
+    for col in numeric_cols:
+        significant_diffs[f'{col}_df1'] = significant_diffs[f'{col}_df1'].round(4)
+        significant_diffs[f'{col}_df2'] = significant_diffs[f'{col}_df2'].round(4)
+        significant_diffs[f'{col}_diff'] = significant_diffs[f'{col}_diff'].round(4)
+    
+    return significant_diffs
 
-def compare_summaries(df1_summaries: dict, df2_summaries: dict, threshold: float = 0.01) -> dict:
-    """
-    Compare two sets of summaries and return differences above threshold
-    """
-    differences = {}
-    
-    # Compare each category present in either summary
-    all_categories = set(df1_summaries.keys()) | set(df2_summaries.keys())
-    
-    for category in all_categories:
-        if category == 'errors':
-            continue
-            
-        category_diffs = []
-        
-        # Handle cases where category exists in both summaries
-        if category in df1_summaries and category in df2_summaries:
-            df1_summary = df1_summaries[category]
-            df2_summary = df2_summaries[category]
-            
-            # Merge the summaries on category and currency
-            merged = pd.merge(
-                df1_summary, 
-                df2_summary,
-                on=[category, 'Currency'],
-                suffixes=('_df1', '_df2'),
-                how='outer'
-            )
-            
-            # Compare numeric columns
-            numeric_cols = [col for col in df1_summary.columns 
-                          if col not in [category, 'Currency', 'count']]
-            
-            for col in numeric_cols:
-                col_df1 = f'{col}_df1'
-                col_df2 = f'{col}_df2'
-                
-                # Calculate relative difference where both values exist
-                mask = merged[col_df1].notna() & merged[col_df2].notna()
-                merged.loc[mask, f'{col}_diff'] = (
-                    (merged[col_df2] - merged[col_df1]).abs() / 
-                    merged[col_df1].abs().clip(lower=1e-10)
-                )
-                
-                # Filter significant differences
-                significant_diffs = merged[
-                    merged[f'{col}_diff'] > threshold
-                ][[category, 'Currency', col_df1, col_df2, f'{col}_diff']]
-                
-                if not significant_diffs.empty:
-                    category_diffs.append({
-                        'column': col,
-                        'differences': significant_diffs
-                    })
-        
-        # Handle categories present in only one summary
-        elif category in df1_summaries:
-            category_diffs.append({
-                'message': f'Category {category} only present in first dataset',
-                'data': df1_summaries[category]
-            })
-        else:
-            category_diffs.append({
-                'message': f'Category {category} only present in second dataset',
-                'data': df2_summaries[category]
-            })
-        
-        if category_diffs:
-            differences[category] = category_diffs
-    
-    return differences
+def create_comparison_table(df: pd.DataFrame) -> dash_table.DataTable:
+    """Create a formatted comparison table"""
+    return dash_table.DataTable(
+        data=df.to_dict('records'),
+        columns=[{"name": i, "id": i} for i in df.columns],
+        style_table={'overflowX': 'auto'},
+        style_cell={
+            'textAlign': 'right',
+            'padding': '10px',
+            'minWidth': '100px'
+        },
+        style_header={
+            'fontWeight': 'bold',
+            'backgroundColor': '#f8f9fa',
+            'textAlign': 'center'
+        },
+        style_data_conditional=[
+            {
+                'if': {
+                    'filter_query': '{{{col}}} < 0'.format(col=col),
+                    'column_id': col
+                },
+                'color': 'red'
+            } for col in df.columns if '_diff' in col
+        ] + [
+            {
+                'if': {
+                    'filter_query': '{{{col}}} > 0'.format(col=col),
+                    'column_id': col
+                },
+                'color': 'green'
+            } for col in df.columns if '_diff' in col
+        ]
+    )
 
-def create_comparison_layout(differences: dict) -> html.Div:
-    """Create the HTML layout for the comparison results"""
+def create_comparison_layout(df1: pd.DataFrame, df2: pd.DataFrame, threshold: float) -> html.Div:
+    """Create improved layout for comparison display"""
     comparison_components = []
     
-    for category, diffs in differences.items():
-        category_cards = []
-        
-        for diff in diffs:
-            if 'message' in diff:
-                # Handle category present in only one dataset
-                card = dbc.Card([
-                    dbc.CardHeader(diff['message']),
-                    dbc.CardBody([
-                        dash_table.DataTable(
-                            data=diff['data'].to_dict('records'),
-                            columns=[{"name": i, "id": i} for i in diff['data'].columns],
-                            style_table={'overflowX': 'auto'}
-                        )
-                    ])
-                ], className="mb-3")
-            else:
-                # Handle numeric differences
-                card = dbc.Card([
-                    dbc.CardHeader(f"Differences in {diff['column']}"),
-                    dbc.CardBody([
-                        dash_table.DataTable(
-                            data=diff['differences'].to_dict('records'),
-                            columns=[{"name": i, "id": i} for i in diff['differences'].columns],
-                            style_table={'overflowX': 'auto'}
-                        )
-                    ])
-                ], className="mb-3")
-            
-            category_cards.append(card)
-        
-        category_section = html.Div([
-            html.H3(f"Differences in {category}", className="mb-3"),
-            html.Div(category_cards)
+    # Get full comparison
+    full_comparison = compare_dataframes(df1, df2, threshold)
+    
+    if not full_comparison.empty:
+        comparison_card = dbc.Card([
+            dbc.CardHeader("Significant Differences", style={'font-weight': 'bold'}),
+            dbc.CardBody([
+                create_comparison_table(full_comparison)
+            ])
         ], className="mb-4")
-        
-        comparison_components.append(category_section)
+        comparison_components.append(comparison_card)
+    else:
+        comparison_components.append(
+            html.Div("No significant differences found", 
+                    className="text-center p-4")
+        )
     
     return html.Div([
         dbc.Container([
             html.H1("DataFrame Comparison", className="text-center mb-4"),
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Precision Threshold:"),
+                    dcc.Slider(
+                        id='precision-slider',
+                        min=0.001,
+                        max=0.1,
+                        step=0.001,
+                        value=0.01,
+                        marks={i/100: f'{i/100:.3f}' for i in range(1, 11)}
+                    )
+                ])
+            ], className="mb-4"),
             html.Div(comparison_components)
         ])
     ])
+
 
 layout = html.Div([
     dbc.Container([
@@ -167,7 +170,5 @@ def update_comparison(threshold, data1, data2):
     df1_summaries = generate_summary(df1)
     df2_summaries = generate_summary(df2)
     
-    # Compare summaries
-    differences = compare_summaries(df1_summaries, df2_summaries, threshold)
-    
-    return create_comparison_layout(differences)
+    # Compare summaries    
+    return create_comparison_layout(df1_summaries, df2_summaries, threshold)
